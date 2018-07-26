@@ -13,6 +13,13 @@ declare(strict_types=1);
 
 namespace ApiPlatform\Core\Hal\Serializer;
 
+use ApiPlatform\Core\Api\OperationType;
+use ApiPlatform\Core\Api\ResourceClassResolverInterface;
+use ApiPlatform\Core\Metadata\Property\Factory\PropertyNameCollectionFactoryInterface;
+use ApiPlatform\Core\Metadata\Resource\Factory\CachedResourceNameCollectionFactory;
+use ApiPlatform\Core\Metadata\Resource\Factory\ResourceMetadataFactoryInterface;
+use ApiPlatform\Core\Operation\Factory\SubresourceOperationFactoryInterface;
+use ApiPlatform\Core\PathResolver\OperationPathResolverInterface;
 use ApiPlatform\Core\Serializer\AbstractCollectionNormalizer;
 use ApiPlatform\Core\Util\IriHelper;
 
@@ -25,6 +32,24 @@ use ApiPlatform\Core\Util\IriHelper;
 final class CollectionNormalizer extends AbstractCollectionNormalizer
 {
     const FORMAT = 'jsonhal';
+
+    private $cachedResourceNameCollectionFactory;
+    private $resourceMetadataFactory;
+    private $operationPathResolver;
+    private $subresourceOperationFactory;
+
+    public function __construct(ResourceClassResolverInterface $resourceClassResolver, string $pageParameterName,
+                                CachedResourceNameCollectionFactory $cachedResourceNameCollectionFactory,
+                                ResourceMetadataFactoryInterface $resourceMetadataFactory,
+                                OperationPathResolverInterface $operationPathResolver,
+                                SubresourceOperationFactoryInterface $subresourceOperationFactory)
+    {
+        parent::__construct($resourceClassResolver, $pageParameterName);
+        $this->cachedResourceNameCollectionFactory = $cachedResourceNameCollectionFactory;
+        $this->resourceMetadataFactory = $resourceMetadataFactory;
+        $this->operationPathResolver = $operationPathResolver;
+        $this->subresourceOperationFactory = $subresourceOperationFactory;
+    }
 
     /**
      * {@inheritdoc}
@@ -66,16 +91,79 @@ final class CollectionNormalizer extends AbstractCollectionNormalizer
         return $data;
     }
 
+    private function getPath(string $resourceShortName, string $operationName, array $operation, string $operationType): string
+    {
+        $path = $this->operationPathResolver->resolveOperationPath($resourceShortName, $operation, $operationType, $operationName);
+        if ('.{_format}' === substr($path, -10)) {
+            $path = substr($path, 0, -10);
+        }
+
+        return $path;
+    }
+
+    private function camelCaseToSnakeCase($str) {
+        $str[0] = strtolower($str[0]);
+        $func = create_function('$c', 'return "_" . strtolower($c[1]);');
+        return preg_replace_callback('/([A-Z])/', $func, $str);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    protected function getTemplatedLinks($context)
+    {
+        $resourceNameCollection = $this->cachedResourceNameCollectionFactory->create();
+
+        $paths = [];
+        foreach ($resourceNameCollection as $resourceClass) {
+            if ($resourceClass != $context['resource_class'])
+                continue;
+            $resourceMetadata = $this->resourceMetadataFactory->create($resourceClass);
+            $resourceShortName = $resourceMetadata->getShortName();
+            $operations = $resourceMetadata->getItemOperations();
+
+            foreach ($operations as $operationName => $operation) {
+                $path = $this->getPath($resourceShortName, $operationName, $operation, OperationType::ITEM);
+                if (in_array($path, array_values($paths)))
+                    continue;
+                $resourceShortName = $this->camelCaseToSnakeCase($resourceShortName);
+                $paths[$resourceShortName] = $path;
+
+                if (null === $this->subresourceOperationFactory) {
+                    continue;
+                }
+
+                foreach ($this->subresourceOperationFactory->create($resourceClass) as $operationId => $subresourceOperation) {
+                    $path = $this->getPath($subresourceOperation['shortNames'][0], $subresourceOperation['route_name'], $subresourceOperation, OperationType::SUBRESOURCE);
+                    if (in_array($path, array_values($paths)))
+                        continue;
+                    $subResourceShortName = $this->camelCaseToSnakeCase($subresourceOperation['shortNames'][0]);
+                    $paths[$subResourceShortName] = $path;
+                }
+            }
+        }
+
+        $links = [];
+        foreach ($paths as $pathName => $pathTemplate) {
+            $links[$pathName] = [
+                'href' => $pathTemplate,
+                'templated' => true
+            ];
+        }
+
+        return $links;
+    }
+
     /**
      * {@inheritdoc}
      */
     protected function getItemsData($object, string $format = null, array $context = []): array
     {
         $data = [];
+        $data['_links'] = $this->getTemplatedLinks($context);
 
         foreach ($object as $obj) {
             $item = $this->normalizer->normalize($obj, $format, $context);
-
             $data['_embedded']['item'][] = $item;
             $data['_links']['item'][] = $item['_links']['self'];
         }
